@@ -1,0 +1,10 @@
+{
+  "name": "learn-with-interview",
+  "description": "Learn any topic deeply by having Claude interview you Socratically on provided reading material. Scores your answers across recall, reasoning, application, and synthesis dimensions, loops until you demonstrate mastery.",
+  "version": "0.1.0",
+  "author": {
+    "name": "vimkim"
+  },
+  "homepage": "https://github.com/vimkim/learn-with-interview",
+  "license": "MIT"
+}
