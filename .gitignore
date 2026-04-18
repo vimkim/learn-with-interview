@@ -1,0 +1,10 @@
+# OMC session / runtime state
+.omc/
+
+# learn-with-interview local session data
+.learn-with-interview.db
+.learn-with-interview-report-*.md
+
+# Python
+__pycache__/
+*.pyc

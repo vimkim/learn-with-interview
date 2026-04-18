@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""learn-with-interview state + scoring CLI.
+
+Offloads JSON persistence, EMA math, gate checking, and report generation
+from the LLM to a deterministic SQLite-backed process. All mutating
+commands accept a JSON payload on stdin; all commands emit compact output
+on stdout. No hidden state outside ./.learn-with-interview.db.
+"""
+import argparse
+import hashlib
+import json
+import re
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+DB_PATH = Path.cwd() / ".learn-with-interview.db"
+ALPHA = 0.4
+DIMS = ("recall", "reasoning", "application", "synthesis")
+GATE = 0.80
+STREAK_NEEDED = 2
+MAX_ROUNDS = 20
+NOT_PROBED = -1.0
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS session (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    recall_ema REAL NOT NULL DEFAULT 0,
+    reasoning_ema REAL NOT NULL DEFAULT 0,
+    application_ema REAL NOT NULL DEFAULT 0,
+    synthesis_ema REAL NOT NULL DEFAULT 0,
+    rounds_above_gate INTEGER NOT NULL DEFAULT 0,
+    terminated INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT
+);
+CREATE TABLE IF NOT EXISTS concept (
+    session_id INTEGER NOT NULL,
+    id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    definition TEXT NOT NULL,
+    citation TEXT NOT NULL DEFAULT '',
+    probes INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, id)
+);
+CREATE TABLE IF NOT EXISTS round (
+    session_id INTEGER NOT NULL,
+    n INTEGER NOT NULL,
+    concept_id INTEGER NOT NULL,
+    targeted_dim TEXT NOT NULL,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    critique TEXT NOT NULL,
+    recall REAL NOT NULL,
+    reasoning REAL NOT NULL,
+    application REAL NOT NULL,
+    synthesis REAL NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (session_id, n)
+);
+"""
+
+
+def db():
+    c = sqlite3.connect(DB_PATH)
+    c.executescript(SCHEMA)
+    return c
+
+
+def stdin_json():
+    raw = sys.stdin.read().strip()
+    return json.loads(raw) if raw else {}
+
+
+def emit(obj):
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def slug_of(s, n=40):
+    s = re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-").lower()
+    return s[:n] or "session"
+
+
+def fresh_emas(row):
+    return {d: row[f"{d}_ema"] for d in DIMS}
+
+
+def compute_next_emas(prev, probed):
+    new = dict(prev)
+    for d in DIMS:
+        s = probed.get(d, NOT_PROBED)
+        if s is None or s < 0:
+            continue
+        new[d] = s if prev[d] == 0 else (1 - ALPHA) * prev[d] + ALPHA * s
+    return new
+
+
+def gate_met(emas):
+    return all(emas[d] >= GATE for d in DIMS)
+
+
+def fmt_table(this_round, emas):
+    lines = ["| Dim | This | EMA | Gate |", "|-----|------|-----|------|"]
+    for d in DIMS:
+        s = this_round.get(d, NOT_PROBED)
+        s_str = f"{s:.2f}" if s is not None and s >= 0 else "—"
+        lines.append(
+            f"| {d.title()} | {s_str} | {emas[d]:.2f} | {'✓' if emas[d] >= GATE else '✗'} |"
+        )
+    return "\n".join(lines)
+
+
+def cmd_init(args):
+    src = args.source
+    h = hashlib.sha256()
+    h.update(src.encode())
+    if not src.startswith(("http://", "https://")):
+        p = Path(src)
+        if p.exists() and p.is_file():
+            h.update(p.read_bytes()[:65536])
+    shash = h.hexdigest()[:16]
+    with db() as c:
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT id FROM session WHERE source_hash=? AND terminated=0 "
+            "ORDER BY id DESC LIMIT 1",
+            (shash,),
+        ).fetchone()
+        if row and not args.fresh:
+            sid = row["id"]
+            r_count = c.execute(
+                "SELECT COUNT(*) FROM round WHERE session_id=?", (sid,)
+            ).fetchone()[0]
+            concepts = c.execute(
+                "SELECT COUNT(*) FROM concept WHERE session_id=?", (sid,)
+            ).fetchone()[0]
+            emit({
+                "session_id": sid,
+                "source_hash": shash,
+                "resumed": True,
+                "rounds_completed": r_count,
+                "concepts_loaded": concepts,
+            })
+            return
+        cur = c.execute(
+            "INSERT INTO session (source, source_hash, started_at) VALUES (?,?,?)",
+            (src, shash, time.time()),
+        )
+        sid = cur.lastrowid
+        c.commit()
+        emit({
+            "session_id": sid,
+            "source_hash": shash,
+            "resumed": False,
+            "rounds_completed": 0,
+            "concepts_loaded": 0,
+        })
+
+
+def cmd_set_concepts(args):
+    payload = stdin_json()
+    concepts = payload.get("concepts", payload if isinstance(payload, list) else [])
+    with db() as c:
+        c.execute("DELETE FROM concept WHERE session_id=?", (args.session,))
+        for i, x in enumerate(concepts, 1):
+            c.execute(
+                "INSERT INTO concept (session_id, id, name, definition, citation) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    args.session,
+                    i,
+                    x["name"],
+                    x["definition"],
+                    x.get("citation", ""),
+                ),
+            )
+        c.commit()
+    emit({"concepts": len(concepts)})
+
+
+def cmd_next_target(args):
+    with db() as c:
+        c.row_factory = sqlite3.Row
+        s = c.execute(
+            "SELECT * FROM session WHERE id=?", (args.session,)
+        ).fetchone()
+        if not s:
+            emit({"error": "session not found"})
+            sys.exit(1)
+        emas = fresh_emas(s)
+        weakest = min(DIMS, key=lambda d: emas[d])
+        concepts = c.execute(
+            "SELECT id, name, definition, citation, probes FROM concept "
+            "WHERE session_id=? ORDER BY probes ASC, id ASC LIMIT 3",
+            (args.session,),
+        ).fetchall()
+        r_count = c.execute(
+            "SELECT COUNT(*) FROM round WHERE session_id=?", (args.session,)
+        ).fetchone()[0]
+    emit({
+        "round": r_count + 1,
+        "max_rounds": MAX_ROUNDS,
+        "weakest_dim": weakest,
+        "weakest_ema": round(emas[weakest], 3),
+        "emas": {d: round(emas[d], 3) for d in DIMS},
+        "rounds_above_gate": s["rounds_above_gate"],
+        "streak_needed": STREAK_NEEDED,
+        "candidates": [dict(x) for x in concepts],
+        "terminated": bool(s["terminated"]),
+    })
+
+
+def cmd_score(args):
+    payload = stdin_json()
+    required = {"concept", "dim", "question", "answer", "critique"}
+    missing = required - payload.keys()
+    if missing:
+        emit({"error": f"missing fields: {sorted(missing)}"})
+        sys.exit(2)
+    probed = {d: float(payload.get(d, NOT_PROBED)) for d in DIMS}
+    with db() as c:
+        c.row_factory = sqlite3.Row
+        s = c.execute(
+            "SELECT * FROM session WHERE id=?", (args.session,)
+        ).fetchone()
+        if not s or s["terminated"]:
+            emit({"error": "session missing or terminated"})
+            sys.exit(1)
+        prev = fresh_emas(s)
+        new_emas = compute_next_emas(prev, probed)
+        r_count = c.execute(
+            "SELECT COUNT(*) FROM round WHERE session_id=?", (args.session,)
+        ).fetchone()[0]
+        n = r_count + 1
+        c.execute(
+            "INSERT INTO round (session_id, n, concept_id, targeted_dim, "
+            "question, answer, critique, recall, reasoning, application, "
+            "synthesis, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                args.session,
+                n,
+                int(payload["concept"]),
+                payload["dim"],
+                payload["question"],
+                payload["answer"],
+                payload["critique"],
+                probed["recall"],
+                probed["reasoning"],
+                probed["application"],
+                probed["synthesis"],
+                time.time(),
+            ),
+        )
+        c.execute(
+            "UPDATE concept SET probes = probes + 1 WHERE session_id=? AND id=?",
+            (args.session, int(payload["concept"])),
+        )
+        all_above = gate_met(new_emas)
+        streak = s["rounds_above_gate"] + 1 if all_above else 0
+        terminated = streak >= STREAK_NEEDED or n >= MAX_ROUNDS
+        outcome = None
+        if streak >= STREAK_NEEDED:
+            outcome = "MASTERY_GATE_MET"
+        elif n >= MAX_ROUNDS:
+            outcome = "MAX_ROUNDS"
+        c.execute(
+            "UPDATE session SET recall_ema=?, reasoning_ema=?, "
+            "application_ema=?, synthesis_ema=?, rounds_above_gate=?, "
+            "terminated=?, outcome=? WHERE id=?",
+            (
+                new_emas["recall"],
+                new_emas["reasoning"],
+                new_emas["application"],
+                new_emas["synthesis"],
+                streak,
+                int(terminated),
+                outcome,
+                args.session,
+            ),
+        )
+        c.commit()
+    weakest = min(DIMS, key=lambda d: new_emas[d])
+    table = fmt_table(probed, new_emas)
+    status_lines = [
+        f"Round {n} complete.",
+        "",
+        table,
+        "",
+        f"Gate streak: {streak}/{STREAK_NEEDED} | "
+        f"Next weakest: {weakest} (EMA {new_emas[weakest]:.2f})",
+    ]
+    if terminated:
+        status_lines.append(f"TERMINATED: {outcome}")
+    emit({
+        "round": n,
+        "emas": {d: round(new_emas[d], 3) for d in DIMS},
+        "weakest_dim": weakest,
+        "weakest_ema": round(new_emas[weakest], 3),
+        "rounds_above_gate": streak,
+        "terminated": terminated,
+        "outcome": outcome,
+        "display": "\n".join(status_lines),
+    })
+
+
+def cmd_stop(args):
+    with db() as c:
+        c.execute(
+            "UPDATE session SET terminated=1, outcome=COALESCE(outcome,'USER_STOPPED') "
+            "WHERE id=?",
+            (args.session,),
+        )
+        c.commit()
+    emit({"terminated": True, "outcome": "USER_STOPPED"})
+
+
+def cmd_status(args):
+    with db() as c:
+        c.row_factory = sqlite3.Row
+        s = c.execute(
+            "SELECT * FROM session WHERE id=?", (args.session,)
+        ).fetchone()
+        if not s:
+            emit({"error": "session not found"})
+            sys.exit(1)
+        r_count = c.execute(
+            "SELECT COUNT(*) FROM round WHERE session_id=?", (args.session,)
+        ).fetchone()[0]
+    emit({
+        "source": s["source"],
+        "rounds": r_count,
+        "emas": {d: round(s[f"{d}_ema"], 3) for d in DIMS},
+        "rounds_above_gate": s["rounds_above_gate"],
+        "terminated": bool(s["terminated"]),
+        "outcome": s["outcome"],
+    })
+
+
+def cmd_report(args):
+    with db() as c:
+        c.row_factory = sqlite3.Row
+        s = c.execute(
+            "SELECT * FROM session WHERE id=?", (args.session,)
+        ).fetchone()
+        if not s:
+            emit({"error": "session not found"})
+            sys.exit(1)
+        concepts = c.execute(
+            "SELECT id, name, definition, citation, probes FROM concept "
+            "WHERE session_id=? ORDER BY probes DESC, id ASC",
+            (args.session,),
+        ).fetchall()
+        rounds = c.execute(
+            "SELECT * FROM round WHERE session_id=? ORDER BY n",
+            (args.session,),
+        ).fetchall()
+    weak_concepts = [c for c in concepts if c["probes"] == 0]
+    title = s["source"]
+    out = [
+        f"# Learning Report: {title}",
+        "",
+        f"- Source: `{s['source']}`",
+        f"- Source hash: `{s['source_hash']}`",
+        f"- Rounds: {len(rounds)}",
+        f"- Outcome: {s['outcome'] or 'IN_PROGRESS'}",
+        f"- Started: {time.strftime('%Y-%m-%d %H:%M', time.localtime(s['started_at']))}",
+        "",
+        "## Final Mastery",
+        "",
+        "| Dimension | EMA | Gate (≥0.80) |",
+        "|-----------|-----|--------------|",
+    ]
+    for d in DIMS:
+        ema = s[f"{d}_ema"]
+        out.append(f"| {d.title()} | {ema:.2f} | {'✓' if ema >= GATE else '✗'} |")
+    out += [
+        "",
+        "## Concepts",
+        "",
+        "| # | Concept | Probes | Definition |",
+        "|---|---------|--------|------------|",
+    ]
+    for c in concepts:
+        defn = c["definition"].replace("|", "\\|")[:140]
+        out.append(f"| {c['id']} | {c['name']} | {c['probes']} | {defn} |")
+    if weak_concepts:
+        out += ["", "## Not Yet Probed", ""]
+        for c in weak_concepts:
+            out.append(f"- {c['name']} — {c['citation']}")
+    out += ["", "## Transcript", ""]
+    for r in rounds:
+        scores = ", ".join(
+            f"{d}={r[d]:.2f}" if r[d] >= 0 else f"{d}=—" for d in DIMS
+        )
+        out += [
+            f"### Round {r['n']} — targeted {r['targeted_dim']}",
+            "",
+            f"**Q:** {r['question']}",
+            "",
+            f"**A:** {r['answer']}",
+            "",
+            f"**Critique:** {r['critique']}",
+            "",
+            f"**Scores:** {scores}",
+            "",
+        ]
+    slug = slug_of(s["source"])
+    path = Path.cwd() / f".learn-with-interview-report-{slug}.md"
+    path.write_text("\n".join(out), encoding="utf-8")
+    emit({"report": str(path), "rounds": len(rounds), "outcome": s["outcome"]})
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="lwi")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pi = sub.add_parser("init", help="create or resume a session for a source")
+    pi.add_argument("source")
+    pi.add_argument("--fresh", action="store_true",
+                    help="ignore any existing session and start new")
+    pi.set_defaults(fn=cmd_init)
+
+    pc = sub.add_parser("set-concepts",
+                        help="store extracted concepts (JSON list on stdin)")
+    pc.add_argument("--session", type=int, required=True)
+    pc.set_defaults(fn=cmd_set_concepts)
+
+    pn = sub.add_parser("next-target",
+                        help="emit weakest dim + candidate concepts")
+    pn.add_argument("--session", type=int, required=True)
+    pn.set_defaults(fn=cmd_next_target)
+
+    ps = sub.add_parser("score",
+                        help="record a round (JSON payload on stdin)")
+    ps.add_argument("--session", type=int, required=True)
+    ps.set_defaults(fn=cmd_score)
+
+    pt = sub.add_parser("stop", help="mark session as user-terminated")
+    pt.add_argument("--session", type=int, required=True)
+    pt.set_defaults(fn=cmd_stop)
+
+    pst = sub.add_parser("status", help="emit current session state")
+    pst.add_argument("--session", type=int, required=True)
+    pst.set_defaults(fn=cmd_status)
+
+    pr = sub.add_parser("report", help="write final report markdown file")
+    pr.add_argument("--session", type=int, required=True)
+    pr.set_defaults(fn=cmd_report)
+
+    return p
+
+
+def main():
+    p = build_parser()
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
