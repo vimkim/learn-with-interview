@@ -1,0 +1,16 @@
+{
+  "name": "learn-with-interview-local",
+  "owner": {
+    "name": "vimkim"
+  },
+  "metadata": {
+    "description": "Local marketplace for the learn-with-interview Socratic drill plugin."
+  },
+  "plugins": [
+    {
+      "name": "learn-with-interview",
+      "source": "./",
+      "description": "Socratic interview drill that scores recall/reasoning/application/synthesis and loops until mastery."
+    }
+  ]
+}
